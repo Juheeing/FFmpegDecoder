@@ -15,12 +15,14 @@
     int dst_linesize[4];
     int vidx, aidx;
     BOOL decodingStopped;
+    BOOL decodingPaused;
 }
 
 - (id) init {
     if (self = [super init]) {
         mDecodingQueue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
         self->decodingStopped = NO;
+        self->decodingPaused = NO;
     }
     return self;
 }
@@ -53,6 +55,17 @@
 
 - (void)stopDecoding {
     self->decodingStopped = YES;
+}
+
+- (void)playPauseDecoding {
+    
+    if (self->decodingPaused) {
+        self->decodingPaused = NO;
+        [self.player play];
+    } else {
+        self->decodingPaused = YES;
+        [self.player pause];
+    }
 }
 
 - (void) openFile:(NSString *)url {
@@ -156,6 +169,11 @@
     });
     
     while (!self->decodingStopped && pFormatContext != NULL) {
+        
+        if (self->decodingPaused) {
+            [NSThread sleepForTimeInterval:0.1]; // Sleep to reduce CPU usage
+            continue;
+        }
         
         if (av_read_frame(pFormatContext, &packet) < 0) {
             NSLog(@"juhee## av_read_frame error");
