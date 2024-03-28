@@ -94,8 +94,6 @@
         return;
     }
     
-    NSLog(@"juhee## 시간 = %lld초\n", pFormatContext->duration / AV_TIME_BASE);
-    
     [self openCodec];
 }
 
@@ -152,6 +150,10 @@
     int videoIframe = 0, videoPframe = 0, videoTotalFrame = 0;  // count GOP test
         
     int ret = 0;
+    int64_t totalDuration = pFormatContext->duration / AV_TIME_BASE;
+    dispatch_sync(dispatch_get_main_queue(), ^{
+        [self->_delegate receivedTotalDuration:totalDuration];
+    });
     
     while (!self->decodingStopped && pFormatContext != NULL) {
         
@@ -159,6 +161,12 @@
             NSLog(@"juhee## av_read_frame error");
             break;
         }
+        
+        int64_t currentTime = (int64_t)((double)vFrame->pts * pVStream->time_base.num / pVStream->time_base.den);
+        NSLog(@"juhee## Current Time: %lld seconds", currentTime);
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            [self->_delegate receivedCurrentTime:currentTime];
+        });
         
         if (packet.stream_index == vidx) {
             
