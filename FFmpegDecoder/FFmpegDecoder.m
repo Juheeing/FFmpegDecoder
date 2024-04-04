@@ -118,7 +118,7 @@
     if (vidx >= 0) {
        pVStream = pFormatContext->streams[vidx];
        pVPara = pVStream->codecpar;
-       pVCodec = avcodec_find_decoder(pVPara->codec_id);
+       pVCodec = (AVCodec*) avcodec_find_decoder(pVPara->codec_id);
        pVCtx = avcodec_alloc_context3(pVCodec);
        avcodec_parameters_to_context(pVCtx, pVPara);
        avcodec_open2(pVCtx, pVCodec, NULL);
@@ -128,7 +128,7 @@
     if (aidx >= 0) {
        pAStream = pFormatContext->streams[aidx];
        pAPara = pAStream->codecpar;
-       pACodec = avcodec_find_decoder(pAPara->codec_id);
+       pACodec = (AVCodec*) avcodec_find_decoder(pAPara->codec_id);
        pACtx = avcodec_alloc_context3(pACodec);
        avcodec_parameters_to_context(pACtx, pAPara);
        avcodec_open2(pACtx, pACodec, NULL);
@@ -151,22 +151,18 @@
     if (pACodec && avcodec_open2(pACtx, pACodec, NULL) < 0) {
         NSLog(@"juhee## Fail to Initialize Audio Decoder");
     }
-    [self decodingFrame];
+    [self decoding];
 }
 
 //파일로부터 인코딩 된 비디오, 오디오 데이터를 읽어서 packet에 저장하는 함수
-- (void) decodingFrame {
+- (void) decoding {
     
     outputFrameSize = CGSizeMake(self->pVCtx->width, self->pVCtx->height);
     NSLog(@"juhee## Video Resolution: %.0f x %.0f", outputFrameSize.width, outputFrameSize.height);
     
-    int videoIframe = 0, videoPframe = 0, videoTotalFrame = 0;  // count GOP test
-        
-    int ret = 0;
-    int64_t totalDuration = pFormatContext->duration / AV_TIME_BASE;
-    dispatch_sync(dispatch_get_main_queue(), ^{
-        [self->_delegate receivedTotalDuration:totalDuration];
-    });
+    //int videoIframe = 0, videoPframe = 0, videoTotalFrame = 0;  // count GOP test
+
+    [self getDuration];
     
     while (!self->decodingStopped && pFormatContext != NULL) {
         
@@ -175,38 +171,33 @@
             continue;
         }
         
-        if (av_read_frame(pFormatContext, &packet) < 0) {
-            NSLog(@"juhee## av_read_frame error");
+        int ret = [self readFrame:&packet];
+        
+        if (ret < 0) {
+            NSLog(@"juhee## readFrame error");
             break;
         }
         
-        int64_t currentTime = (int64_t)((double)vFrame->pts * pVStream->time_base.num / pVStream->time_base.den);
-        NSLog(@"juhee## Current Time: %lld seconds", currentTime);
-        dispatch_sync(dispatch_get_main_queue(), ^{
-            [self->_delegate receivedCurrentTime:currentTime];
-        });
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+
+            break;
+            
+        } else if (ret < 0) {
+            
+            NSLog(@"juhee## error during video decoding");
+            break;
+            
+        }
+        
+        [self getCurrentTime];
         
         if (packet.stream_index == vidx) {
-            
-            if (avcodec_send_packet(pVCtx, &packet) < 0) {  // 압축된 데이터 패킷을 디코더로 전송
-                NSLog(@"juhee## video avcodec_send_packet error");
-                break;
-            }
-            
-            ret = avcodec_receive_frame(pVCtx, vFrame); //디코딩된 비디오 프레임을 저장(YUV data)
-            
-            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-                
-                break;
-                
-            } else if (ret < 0) {
-                
-                NSLog(@"juhee## error during video decoding");
-                break;
-                
+
+            if ([self decodeFrame:pVCtx packet:&packet frame:vFrame]) {
+                [self drawImage];
             }
                 
-            videoTotalFrame ++;
+            /*videoTotalFrame ++;
 
             //count GOP
             if (packet.flags & AV_PKT_FLAG_KEY) { // I frame
@@ -218,92 +209,125 @@
             } else { // P frame
                 
                 videoPframe++;
-            }
-            
-            if (swsCtx == NULL) {
-                static int sws_flags =  SWS_FAST_BILINEAR;
-                swsCtx = sws_getContext(pVCtx->width, pVCtx->height, pVCtx->pix_fmt, outputFrameSize.width, outputFrameSize.height, AV_PIX_FMT_RGB24, sws_flags, NULL, NULL, NULL);
-                
-                ret = av_image_alloc(dst_data, dst_linesize, pVCtx->width, pVCtx->height, AV_PIX_FMT_RGB24, 1);
-                
-            }
-           
-            ret = sws_scale(swsCtx, (uint8_t const * const *)vFrame->data, vFrame->linesize, 0, pVCtx->height, dst_data, dst_linesize);
-            
-            if (_delegate) {
-               UIImage *image = [self convertToUIImageFromYUV:dst_data linesize:dst_linesize[0] width:vFrame->width height:vFrame->height];
-               dispatch_sync(dispatch_get_main_queue(), ^{
-                   if (image!= nil && (image.CGImage != nil || image.CIImage != nil)) {
-                       //[self->_delegate receivedDecodedImage:[UIImage imageWithData:UIImagePNGRepresentation(image)]]; // png형식으로 압축 후 전달하기 때문에 row memory, high cpu
-                       //[self->_delegate receivedDecodedImage:image]; // 압축 없이 원본을 전달하기 때문에 row cpu, high memory
-                       [self->_delegate receivedDecodedImage:[UIImage imageWithData:UIImageJPEGRepresentation(image, 0.5)]];
-                   } else {
-                       [self->_delegate receivedDecodedImage:nil];
-                   }
-               });
-           }
-            
+            }*/
+
         } else if (packet.stream_index == aidx) {
             
-            if (avcodec_send_packet(pACtx, &packet) < 0) {  // 압축된 데이터 패킷을 디코더로 전송
-                NSLog(@"juhee## audio avcodec_send_packet error");
-                break;
+            if ([self decodeFrame:pACtx packet:&packet frame:aFrame]) {
+                [self drawAudio];
             }
-            
-            ret = avcodec_receive_frame(pACtx, aFrame); //디코딩된 오디오 프레임을 저장(PCM data)
-            
-            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-                
-                break;
-                
-            } else if (ret < 0) {
-                
-                NSLog(@"juhee## error during audio decoding");
-                break;
-                
-            }
-            
-            AVAudioFormat *format = [[AVAudioFormat alloc] initWithCommonFormat:AVAudioPCMFormatFloat32 sampleRate:aFrame->sample_rate channels:aFrame->channels interleaved:NO];
-            
-            if (![self.player isPlaying]) {
-                self.engine = [[AVAudioEngine alloc] init];
-                self.player = [[AVAudioPlayerNode alloc] init];
-                self.player.volume = 0.5;
-                [self.engine attachNode:self.player];
-
-                AVAudioMixerNode *mainMixer = [self.engine mainMixerNode];
-                
-                [self.engine connect:self.player to:mainMixer format:format];
-                
-                if (!self.engine.isRunning) {
-                    [self.engine prepare];
-                    NSError *error;
-                    BOOL success;
-                    success = [self.engine startAndReturnError:&error];
-                    NSAssert(success, @"couldn't start engine, %@", [error localizedDescription]);
-                }
-                [self.player play];
-            }
-            
-            NSData *data = [self playAudioFrame:aFrame];
-            AVAudioPCMBuffer *pcmBuffer = [[AVAudioPCMBuffer alloc]
-                                          initWithPCMFormat:format
-                                          frameCapacity:(uint32_t)(data.length)
-                                          /format.streamDescription->mBytesPerFrame];
-
-            pcmBuffer.frameLength = pcmBuffer.frameCapacity;
-
-            [data getBytes:*pcmBuffer.floatChannelData length:data.length];
-
-            [self.player scheduleBuffer:pcmBuffer completionHandler:nil];
         }
     }
     
-    NSLog(@"juhee## videoTotalFrame: %d", videoTotalFrame);
+    //NSLog(@"juhee## videoTotalFrame: %d", videoTotalFrame);
 
     [self clear];
 }
 
+- (int) readFrame:(AVPacket *)packet {
+    
+    int res = -1;
+    
+    @try {
+        res = av_read_frame(pFormatContext, packet);
+    } @catch (NSException *exception) {
+        NSLog(@"juhee## av_read_frame error: %@", exception);
+    }
+    return res;
+}
+
+- (BOOL) decodeFrame:(AVCodecContext *)ctx packet:(AVPacket *)packet frame:(AVFrame *)frame {
+    
+    BOOL dec = true;
+    
+    @try {
+        if (avcodec_send_packet(ctx, packet) < 0) { // 압축된 데이터 패킷을 디코더로 전송
+            dec = false;
+            NSLog(@"juhee## avcodec_send_packet error");
+        } else if (avcodec_receive_frame(ctx, frame) < 0) { //디코딩된 비디오 프레임을 저장(YUV data, PCM data)
+            dec = false;
+            NSLog(@"juhee## avcodec_receive_frame error");
+        }
+    } @catch (NSException *exception) {
+        dec = false;
+        NSLog(@"juhee## decodeFrame error: %@", exception);
+    }
+    
+    return dec;
+}
+
+- (void) drawImage {
+    if (swsCtx == NULL) {
+        static int sws_flags =  SWS_FAST_BILINEAR;
+        swsCtx = sws_getContext(pVCtx->width, pVCtx->height, pVCtx->pix_fmt, outputFrameSize.width, outputFrameSize.height, AV_PIX_FMT_RGB24, sws_flags, NULL, NULL, NULL);
+        av_image_alloc(dst_data, dst_linesize, pVCtx->width, pVCtx->height, AV_PIX_FMT_RGB24, 1);
+    }
+    sws_scale(swsCtx, (uint8_t const * const *)vFrame->data, vFrame->linesize, 0, pVCtx->height, dst_data, dst_linesize);
+    
+    if (_delegate) {
+       UIImage *image = [self convertToUIImageFromYUV:dst_data linesize:dst_linesize[0] width:vFrame->width height:vFrame->height];
+       dispatch_sync(dispatch_get_main_queue(), ^{
+           if (image!= nil && (image.CGImage != nil || image.CIImage != nil)) {
+               //[self->_delegate receivedDecodedImage:[UIImage imageWithData:UIImagePNGRepresentation(image)]]; // png형식으로 압축 후 전달하기 때문에 row memory, high cpu
+               //[self->_delegate receivedDecodedImage:image]; // 압축 없이 원본을 전달하기 때문에 row cpu, high memory
+               [self->_delegate receivedDecodedImage:[UIImage imageWithData:UIImageJPEGRepresentation(image, 0.5)]];
+           } else {
+               [self->_delegate receivedDecodedImage:nil];
+           }
+       });
+   }
+}
+
+- (void) getDuration {
+    int64_t totalDuration = pFormatContext->duration / AV_TIME_BASE;
+    dispatch_sync(dispatch_get_main_queue(), ^{
+        [self->_delegate receivedTotalDuration:totalDuration];
+    });
+}
+
+- (void) getCurrentTime {
+    int64_t currentTime = (int64_t)((double)vFrame->pts * pVStream->time_base.num / pVStream->time_base.den);
+    NSLog(@"juhee## Current Time: %lld seconds", currentTime);
+    dispatch_sync(dispatch_get_main_queue(), ^{
+        [self->_delegate receivedCurrentTime:currentTime];
+    });
+}
+
+- (void) drawAudio {
+    AVAudioFormat *format = [[AVAudioFormat alloc] initWithCommonFormat:AVAudioPCMFormatFloat32 sampleRate:aFrame->sample_rate channels:aFrame->channels interleaved:NO];
+    
+    if (![self.player isPlaying]) {
+        self.engine = [[AVAudioEngine alloc] init];
+        self.player = [[AVAudioPlayerNode alloc] init];
+        self.player.volume = 0.5;
+        [self.engine attachNode:self.player];
+
+        AVAudioMixerNode *mainMixer = [self.engine mainMixerNode];
+        
+        [self.engine connect:self.player to:mainMixer format:format];
+        
+        if (!self.engine.isRunning) {
+            [self.engine prepare];
+            NSError *error;
+            BOOL success;
+            success = [self.engine startAndReturnError:&error];
+            NSAssert(success, @"couldn't start engine, %@", [error localizedDescription]);
+        }
+        [self.player play];
+    }
+    
+    NSData *data = [self playAudioFrame:aFrame];
+    AVAudioPCMBuffer *pcmBuffer = [[AVAudioPCMBuffer alloc]
+                                  initWithPCMFormat:format
+                                  frameCapacity:(uint32_t)(data.length)
+                                  /format.streamDescription->mBytesPerFrame];
+
+    pcmBuffer.frameLength = pcmBuffer.frameCapacity;
+
+    [data getBytes:*pcmBuffer.floatChannelData length:data.length];
+
+    [self.player scheduleBuffer:pcmBuffer completionHandler:nil];
+}
 
 - (UIImage *) convertToUIImageFromYUV:(uint8_t **)dstData linesize:(int)linesize width:(int)width height:(int)height{
     
