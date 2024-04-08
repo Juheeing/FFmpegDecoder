@@ -22,5 +22,6 @@
 - (void) startStreaming:(NSString *)url;
 - (void) stopDecoding;
 - (void) playPauseDecoding;
+- (BOOL) progressDecoding;
 
 @end
