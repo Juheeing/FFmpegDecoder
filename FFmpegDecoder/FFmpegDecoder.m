@@ -11,18 +11,21 @@
     AVFrame *vFrame, *aFrame;
     CGSize outputFrameSize;
     dispatch_queue_t mDecodingQueue;
+    dispatch_semaphore_t pauseSemaphore;
     uint8_t *dst_data[4];
     int dst_linesize[4];
     int vidx, aidx;
     BOOL decodingStopped;
     BOOL decodingPaused;
+    BOOL decodingProgress;
 }
 
 - (id) init {
     if (self = [super init]) {
         mDecodingQueue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
-        self->decodingStopped = NO;
-        self->decodingPaused = NO;
+        pauseSemaphore = dispatch_semaphore_create(0);
+        decodingStopped = NO;
+        decodingPaused = NO;
     }
     return self;
 }
@@ -34,6 +37,7 @@
 }
 
 - (void) clear {
+    decodingProgress = NO;
     av_packet_unref(&packet);
     if (vFrame) { av_frame_free(&vFrame); av_frame_unref(vFrame); vFrame = NULL; }
     if (aFrame) { av_frame_free(&aFrame); av_frame_unref(aFrame); aFrame = NULL; }
@@ -47,7 +51,8 @@
 }
 
 - (void)startStreaming:(NSString *)url {
-    self->decodingStopped = NO;
+    decodingStopped = NO;
+    decodingProgress = YES;
     dispatch_async(mDecodingQueue, ^{
         [self openFile: url];
     });
@@ -57,13 +62,20 @@
     self->decodingStopped = YES;
 }
 
+- (BOOL)progressDecoding {
+    return decodingProgress;
+}
+
 - (void)playPauseDecoding {
     
     if (self->decodingPaused) {
-        self->decodingPaused = NO;
+        decodingPaused = NO;
+        decodingProgress = YES;
+        dispatch_semaphore_signal(pauseSemaphore);
         [self.player play];
     } else {
-        self->decodingPaused = YES;
+        decodingPaused = YES;
+        decodingProgress = NO;
         [self.player pause];
     }
 }
@@ -165,10 +177,9 @@
     [self getDuration];
     
     while (!self->decodingStopped && pFormatContext != NULL) {
-        
+
         if (self->decodingPaused) {
-            [NSThread sleepForTimeInterval:0.1]; // Sleep to reduce CPU usage
-            continue;
+            dispatch_semaphore_wait(pauseSemaphore, DISPATCH_TIME_FOREVER);
         }
         
         int ret = [self readFrame:&packet];
@@ -287,7 +298,7 @@
 
 - (void) getCurrentTime {
     int64_t currentTime = (int64_t)((double)vFrame->pts * pVStream->time_base.num / pVStream->time_base.den);
-    NSLog(@"juhee## Current Time: %lld seconds", currentTime);
+    //NSLog(@"juhee## Current Time: %lld seconds", currentTime);
     dispatch_sync(dispatch_get_main_queue(), ^{
         [self->_delegate receivedCurrentTime:currentTime];
     });
