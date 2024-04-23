@@ -17,8 +17,8 @@
     BOOL decodingStopped;
     BOOL decodingPaused;
     BOOL decodingProgress;
-    int64_t currentTime;
-    int64_t pauseTime;
+    BOOL isSeeking;
+    int64_t pauseFrame;
     NSCondition *pauseCondition;
 }
 
@@ -28,6 +28,7 @@
         pauseCondition = [[NSCondition alloc] init];
         decodingStopped = NO;
         decodingPaused = NO;
+        isSeeking = NO;
     }
     return self;
 }
@@ -41,7 +42,6 @@
 
 - (void) clear {
     decodingProgress = NO;
-    av_packet_unref(&packet);
     if (vFrame) { av_frame_free(&vFrame); av_frame_unref(vFrame); vFrame = NULL; }
     if (aFrame) { av_frame_free(&aFrame); av_frame_unref(aFrame); aFrame = NULL; }
     if (pVCtx) { avcodec_close(pVCtx); avcodec_free_context(&pVCtx); pVCtx = NULL; }
@@ -73,18 +73,13 @@
     dispatch_async(mDecodingQueue, ^{
         self->decodingPaused = !self->decodingPaused;
         if (self->decodingPaused) {
-            self->pauseTime = self->currentTime;
+            self->pauseFrame = [self getCurrentFrame];
             self->decodingProgress = NO;
-            [self.player pause];
+            //[self.player pause];
         } else {
             [self->pauseCondition signal];
-            sleep(0.1);
-            int res = av_read_play(self->pFormatContext);
-            NSLog(@"juhee## av_read_play: %d", res);
-            sleep(0.1);
-            [self seekToTime:self->pauseTime];
             self->decodingProgress = YES;
-            [self.player play];
+            //[self.player play];
         }
     });
 }
@@ -92,16 +87,9 @@
 - (void) openFile:(NSString *)url {
     NSLog(@"juhee## url: %@", url);
     
+    avformat_network_init();
     pFormatContext = avformat_alloc_context();
-    vFrame = av_frame_alloc();
-    aFrame = av_frame_alloc();
-    
-    if (!vFrame || !aFrame) {
-        NSLog(@"juhee## Failed to allocate frames");
-        [self stopDecoding];
-        return;
-    }
-    
+
     AVDictionary *opts = 0;
     int ret = 0;
     /*ret = av_dict_set(&opts, "rtsp_transport", "tcp", 0);
@@ -178,84 +166,57 @@
 //파일로부터 인코딩 된 비디오, 오디오 데이터를 읽어서 packet에 저장하는 함수
 - (void) decoding {
     
+    vFrame = av_frame_alloc();
+    aFrame = av_frame_alloc();
+    packet = *av_packet_alloc();
+    
     outputFrameSize = CGSizeMake(self->pVCtx->width, self->pVCtx->height);
     NSLog(@"juhee## Video Resolution: %.0f x %.0f", outputFrameSize.width, outputFrameSize.height);
     
-    //int videoIframe = 0, videoPframe = 0, videoTotalFrame = 0;  // count GOP test
     [self getDuration];
     
     while (!self->decodingStopped && pFormatContext != NULL) {
-        
-        [pauseCondition lock];
-        
-        if (decodingPaused) {
-            sleep(0.1);
-            int res = av_read_pause(pFormatContext);
-            NSLog(@"juhee## av_read_pause: %d", res);
-            [pauseCondition wait];
-        }
-        
-        [pauseCondition unlock];
-                
-        [self getCurrentTime];
-        
-        int ret = [self readFrame:&packet];
 
-        if (ret == AVERROR_EOF) {
-            NSLog(@"juhee## readFrame EOF");
-            break;
-        }
-        
-        if (ret != 0) { continue; }
+        while ([self readFrame:&packet] >= 0) {
 
-        if (ret >= 0) {
+            [self getCurrentTime];
+            
+            [pauseCondition lock];
+            
+            if (decodingPaused) {
+                av_read_pause(pFormatContext);
+                do {
+                    [pauseCondition wait];
+                } while (decodingPaused);
+                av_read_play(pFormatContext);
+                isSeeking = YES;
+            }
+            [pauseCondition unlock];
+            
+            if (isSeeking) {
+                isSeeking = NO;
+                [self seekToFrame:pauseFrame];
+            }
             
             if (packet.stream_index == vidx) {
-                
-                ret = [self sendPacket:pVCtx packet:&packet];
-                
-                if (ret != 0) { continue; }
-                
-                if (ret >= 0) {
-                    
-                    ret = [self receiveFrame:pVCtx frame:vFrame];
-                    
-                    if (ret == AVERROR_EOF) {
-                        NSLog(@"juhee## video receiveFrame EOF");
-                        break;
-                    }
-                    if (ret != 0) { continue; }
-                    
-                    if (ret >= 0 && !decodingPaused) {
+                if ([self sendPacket:pVCtx packet:&packet] >= 0) {
+                    int ret = [self receiveFrame:pVCtx frame:vFrame];
+                    if (ret >= 0) {
                         [self drawImage];
                     }
                 }
-                
-            } else if (packet.stream_index == aidx) {
-                
-                ret = [self sendPacket:pACtx packet:&packet];
-                
-                if (ret != 0) { continue; }
-                
-                if (ret >= 0) {
-                    
-                    ret = [self receiveFrame:pACtx frame:aFrame];
-                    
-                    if (ret == AVERROR_EOF) {
-                        NSLog(@"juhee## audio receiveFrame EOF");
-                        break;
-                    }
-                    
-                    if (ret != 0) { continue; }
-                    
-                    if (ret >= 0 && !decodingPaused) {
+            }
+            if (packet.stream_index == aidx) {
+                if ([self sendPacket:pACtx packet:&packet] >= 0) {
+                    int ret = [self receiveFrame:pACtx frame:aFrame];
+                    if (ret >= 0) {
                         [self drawAudio];
                     }
                 }
             }
+            av_packet_unref(&packet);
         }
     }
-    
     [self clear];
 }
 
@@ -265,6 +226,11 @@
     if (!decodingPaused && pFormatContext != NULL) {
         @try {
             ret = av_read_frame(pFormatContext, packet);
+            
+            if (ret == AVERROR_EOF) {
+                NSLog(@"juhee## readFrame EOF");
+                [self stopDecoding];
+            }
         } @catch (NSException *exception) {
             NSLog(@"juhee## av_read_frame error: %@", exception);
         }
@@ -273,6 +239,7 @@
 }
 
 - (int) sendPacket:(AVCodecContext *)ctx packet:(AVPacket *)packet {
+    
     int ret = -1;
     if(!decodingPaused && ctx != NULL) {
         @try {
@@ -285,6 +252,7 @@
 }
 
 - (int) receiveFrame:(AVCodecContext *)ctx frame:(AVFrame *)frame {
+    
     int ret = -1;
     if (!decodingPaused && ctx != NULL) {
         @try {
@@ -293,6 +261,34 @@
             NSLog(@"juhee## avcodec_receive_frame error");
         }
     }
+    return ret;
+}
+
+- (int) readPlay {
+    
+    int ret = -1;
+    
+    @try {
+        ret = av_read_play(pFormatContext);
+        NSLog(@"juhee## av_read_play: %d", ret);
+    } @catch (NSException *exception) {
+        NSLog(@"juhee## av_read_play error %@", exception);
+    }
+    
+    return ret;
+}
+
+- (int) readPause {
+    
+    int ret = -1;
+    
+    @try {
+        ret = av_read_pause(pFormatContext);
+        NSLog(@"juhee## av_read_pause: %d", ret);
+    } @catch (NSException *exception) {
+        NSLog(@"juhee## av_read_pause error %@", exception);
+    }
+    
     return ret;
 }
 
@@ -326,7 +322,7 @@
 }
 
 - (void) getCurrentTime {
-    currentTime = (int64_t)((double)vFrame->pts * pVStream->time_base.num / pVStream->time_base.den);
+    int64_t currentTime = (int64_t)((double)vFrame->pts * pVStream->time_base.num / pVStream->time_base.den);
     //NSLog(@"juhee## Current Time: %lld seconds", currentTime);
     dispatch_sync(dispatch_get_main_queue(), ^{
         [self->_delegate receivedCurrentTime:currentTime];
@@ -397,23 +393,31 @@
     return audioData;
 }
 
-- (void)seekToTime:(int64_t)timeInSeconds {
-    if (!pFormatContext) {
+- (void)seekToFrame:(int64_t)frame {
+    if (frame < 0) {
+        NSLog(@"juhee## frame is NULL");
         return;
     }
-    pauseTime = 0;
-    int64_t targetTimestamp = timeInSeconds * AV_TIME_BASE;
-
-    int ret = av_seek_frame(pFormatContext, -1, targetTimestamp, AVSEEK_FLAG_BACKWARD);
+    avcodec_flush_buffers(pVCtx);
+    avcodec_flush_buffers(pACtx);
+    
+    int ret = av_seek_frame(pFormatContext, -1, frame, AVSEEK_FLAG_FRAME);
     NSLog(@"juhee## av_seek_frame: %d", ret);
-
+    
     if (ret < 0) {
         NSLog(@"juhee## Seek failed");
         return;
     }
-    
-    avcodec_flush_buffers(pVCtx);
-    avcodec_flush_buffers(pACtx);
+}
+
+- (int64_t)getCurrentFrame {
+    if (pVStream && vFrame) {
+        int64_t pts = vFrame->pts;
+        AVRational timeBase = pVStream->time_base;
+        int64_t frameNumber = pts * timeBase.num / timeBase.den;
+        return frameNumber;
+    }
+    return -1;
 }
 
 @end
