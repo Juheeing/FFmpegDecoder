@@ -1,4 +1,5 @@
 #import "FFmpegDecoder.h"
+#import "TWiOSViewer-Swift.h"
 
 @implementation FFmpegDecoder {
     struct SwsContext* swsCtx;
@@ -105,6 +106,7 @@
     if (ret != 0) {
         NSLog(@"juhee## File Open Failed");
         [self stopDecoding];
+        [self dismissPlayer];
         return;
     }
     
@@ -113,6 +115,7 @@
     if (ret < 0 ) {
         NSLog(@"juhee## Fail to get Stream Info");
         [self stopDecoding];
+        [self dismissPlayer];
         return;
     }
     
@@ -230,6 +233,7 @@
             if (ret == AVERROR_EOF) {
                 NSLog(@"juhee## readFrame EOF");
                 [self stopDecoding];
+                [self dismissPlayer];
             }
         } @catch (NSException *exception) {
             NSLog(@"juhee## av_read_frame error: %@", exception);
@@ -314,6 +318,12 @@
    }
 }
 
+- (void) dismissPlayer {
+    dispatch_sync(dispatch_get_main_queue(), ^{
+        [self->_delegate dismissPlayer:YES];
+    });
+}
+
 - (void) getDuration {
     int64_t totalDuration = pFormatContext->duration / AV_TIME_BASE;
     dispatch_sync(dispatch_get_main_queue(), ^{
@@ -368,23 +378,36 @@
 - (UIImage *) convertToUIImageFromYUV:(uint8_t **)dstData linesize:(int)linesize width:(int)width height:(int)height{
     
     CGBitmapInfo bitmapInfo = kCGBitmapByteOrderDefault;
-    CFDataRef data = CFDataCreateWithBytesNoCopy(kCFAllocatorDefault, dstData[0], linesize*height, kCFAllocatorNull);
+    CFDataRef data = CFDataCreateWithBytesNoCopy(kCFAllocatorDefault, dstData[0], linesize * height, kCFAllocatorNull);
     
     CGDataProviderRef provider = CGDataProviderCreateWithCFData(data);
     CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
     
-    CGImageRef cgImage = CGImageCreate((unsigned long) vFrame->width,(unsigned long) vFrame->height, 8, 24, (size_t) linesize, colorSpace, bitmapInfo, provider, NULL, NO, kCGRenderingIntentDefault);
+    CGImageRef cgImage = CGImageCreate((unsigned long)width,
+                                       (unsigned long)height,
+                                       8,
+                                       24,
+                                       (size_t)linesize,
+                                       colorSpace,
+                                       bitmapInfo,
+                                       provider,
+                                       NULL,
+                                       NO,
+                                       kCGRenderingIntentDefault);
     
     CGColorSpaceRelease(colorSpace);
-    UIImage *image = [UIImage imageWithCGImage:cgImage];
+    CIImage *ciImage = [CIImage imageWithCGImage:cgImage];
+    CIImage *grayscaleCIImage = [self grayscaleFilter:ciImage];
+    if (!grayscaleCIImage) {
+        grayscaleCIImage = ciImage;
+    }
+    UIImage *image = [UIImage imageWithCIImage:grayscaleCIImage];
     CGImageRelease(cgImage);
     CGDataProviderRelease(provider);
     CFRelease(data);
     
     return image;
-    
 }
-
 - (NSData *)playAudioFrame:(AVFrame *)audioFrame {
     
     int dataSize = av_get_bytes_per_sample(pACtx->sample_fmt) * pACtx->channels * audioFrame->nb_samples;
@@ -418,6 +441,11 @@
         return frameNumber;
     }
     return -1;
+}
+
+- (CIImage *)grayscaleFilter:(CIImage *)input {
+    Filter *filter = [[Filter alloc] init];
+    return [filter outputImageWithInput:input];
 }
 
 @end

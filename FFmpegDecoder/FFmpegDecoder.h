@@ -4,12 +4,14 @@
 #import "libavutil/imgutils.h"
 #import "libavcodec/avcodec.h"
 #import "libswscale/swscale.h"
+#import <Metal/Metal.h>
 
 @protocol DecoderDelegate <NSObject>
 
 - (void) receivedDecodedImage:(UIImage *)image;
 - (void) receivedCurrentTime:(int64_t)seconds;
 - (void) receivedTotalDuration:(int64_t)seconds;
+- (void) dismissPlayer:(BOOL)dismiss;
 
 @end
 
