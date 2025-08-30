@@ -1,28 +1,14 @@
 #import "FFmpegDecoder.h"
 
-static void ffmpeg_log_callback(void* ptr, int level, const char* fmt, va_list vl)
-{
-    if (level > av_log_get_level()) return;
-
-    char log_buf[1024];
-    vsnprintf(log_buf, sizeof(log_buf), fmt, vl);
-    
-    NSString *logMessage = [NSString stringWithUTF8String:log_buf];
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-        NSLog(@"%@", logMessage);
-    });
-}
-
 @implementation FFmpegDecoder {
-    struct SwsContext* swsCtx;
-    AVFormatContext *pFormatContext;
-    AVCodecContext *pVCtx, *pACtx;
-    AVCodecParameters *pVPara, *pAPara;
-    AVCodec *pVCodec, *pACodec;
-    AVStream* pVStream, * pAStream;
-    AVPacket packet;
-    AVFrame *vFrame, *aFrame;
+    struct SwsContext* swsCtx;  // sws_scale()를 위한 색공간/포맷 변환 컨텍스트(예: YUV420p → RGB24)
+    AVFormatContext *pFormatContext;    // avformat의 컨텍스트(입력 스트림 전체 정보: 포맷, 스트림 목록 등).
+    AVCodecContext *pVCtx, *pACtx;  // 실제 디코더 인스턴스(설정 포함) — 디코딩 상태(버퍼 등)를 가짐
+    AVCodecParameters *pVPara, *pAPara; // 스트림의 “메타/파라미터” (codec_id, width/height, sample_rate, channel_layout, extradata 등)
+    AVCodec *pVCodec, *pACodec; // 특정 코덱(예: h264, aac)을 표현하는 FFmpeg 내부의 설명자
+    AVStream* pVStream, * pAStream; // 입력 컨테이너 안의 각 스트림(예: video #0, audio #1)을 나타냄. 각 스트림은 time_base, codec parameters 등을 가짐
+    AVPacket packet;    // 컨테이너에서 읽은 “인코딩된 (압축된) 데이터 블록” (예: NAL unit, AAC frame)
+    AVFrame *vFrame, *aFrame;   // 디코딩 후의 “원시 프레임” (비디오: YUV/RGB, 오디오: PCM(플래너/인터리브))
     CGSize outputFrameSize;
     dispatch_queue_t mDecodingQueue;
     uint8_t *dst_data[4];
@@ -32,11 +18,11 @@ static void ffmpeg_log_callback(void* ptr, int level, const char* fmt, va_list v
     BOOL isPaused, isPlaying, isSeeking;
     double seekTarget;
     NSCondition *pauseCondition;
-    dispatch_source_t keepAliveTimer;
     int64_t lastRescaledPTS;      // 이전 프레임 pts (rescaled)
     int64_t ptsOffset;           // 누적 offset
     BOOL hasPendingSeek;         // seek 직후 첫 프레임에서 보정할 플래그
     double pendingSeekSeconds;   // 사용자가 요청한 seek 시간
+    double currentBrightness, currentContrast;
 }
 
 + (instancetype)sharedInstance {
@@ -60,6 +46,8 @@ static void ffmpeg_log_callback(void* ptr, int level, const char* fmt, va_list v
         ptsOffset = 0;
         hasPendingSeek = NO;
         pendingSeekSeconds = 0;
+        currentBrightness = 0.0;
+        currentContrast = 1.0;
     }
     return self;
 }
@@ -130,6 +118,14 @@ static void ffmpeg_log_callback(void* ptr, int level, const char* fmt, va_list v
     });
 }
 
+- (void)setBrightness:(double)bright contrast:(double)contrast {
+    dispatch_async(mDecodingQueue, ^{
+        self->currentBrightness = bright;
+        self->currentContrast = contrast;
+    });
+}
+
+// MARK: - 스트림 열기 및 헤더/메타 정보 읽기
 - (void) openFile:(NSString *)url {
     NSLog(@"FFmpeg## openFile: %@", url);
     
@@ -137,17 +133,16 @@ static void ffmpeg_log_callback(void* ptr, int level, const char* fmt, va_list v
         [self->_delegate receivedState:0];
     });
     av_log_set_level(AV_LOG_DEBUG);
-    av_log_set_callback(ffmpeg_log_callback);
     avformat_network_init();
     pFormatContext = avformat_alloc_context();
     
     AVDictionary *opts = 0;
     int ret = 0;
-    av_dict_set(&opts, "rtsp_transport", "tcp", 0);
+    //av_dict_set(&opts, "rtsp_transport", "tcp", 0);
 
-    //미디어 파일 열기
-    //파일의 헤더로 부터 파일 포맷에 대한 정보를 읽어낸 뒤 첫번째 인자 (AVFormatContext) 에 저장.
-    //그 뒤의 인자들은 각각 Input Source (스트리밍 URL이나 파일경로), Input Format, demuxer의 추가옵션.
+    // 미디어 파일 열기
+    // 파일의 헤더로 부터 파일 포맷에 대한 정보를 읽어낸 뒤 첫번째 인자 (AVFormatContext) 에 저장.
+    // 그 뒤의 인자들은 각각 Input Source (스트리밍 URL이나 파일경로), Input Format, demuxer의 추가옵션.
     ret = avformat_open_input(&pFormatContext, [url UTF8String], NULL, &opts);
     
     if (ret != 0) {
@@ -158,7 +153,7 @@ static void ffmpeg_log_callback(void* ptr, int level, const char* fmt, va_list v
         });
         return;
     }
-    
+    // 스트림 정보 얻기
     ret = avformat_find_stream_info(pFormatContext, NULL);
     
     if (ret < 0 ) {
@@ -170,7 +165,9 @@ static void ffmpeg_log_callback(void* ptr, int level, const char* fmt, va_list v
     [self openCodec];
 }
 
+// MARK: - 스트림에서 비디오/오디오 인덱스 찾고, 각 디코더 컨텍스트(AVCodecContext)를 준비하고 오픈
 - (void) openCodec {
+    // 비디오, 오디오 스트림 인덱스 찾기
     vidx = av_find_best_stream(pFormatContext, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
     aidx = av_find_best_stream(pFormatContext, AVMEDIA_TYPE_AUDIO, -1, vidx, NULL, 0);
     
@@ -214,7 +211,7 @@ static void ffmpeg_log_callback(void* ptr, int level, const char* fmt, va_list v
     [self decoding];
 }
 
-//파일로부터 인코딩 된 비디오, 오디오 데이터를 읽어서 packet에 저장하는 함수
+// MARK: - 파일로부터 인코딩 된 비디오, 오디오 데이터를 읽어서 packet에 저장하는 함수
 - (void) decoding {
     
     dispatch_sync(dispatch_get_main_queue(), ^{
@@ -454,26 +451,72 @@ static void ffmpeg_log_callback(void* ptr, int level, const char* fmt, va_list v
     });
 }
 
-- (void) drawImage {
+- (void)drawImage {
+    int width = vFrame->width;
+    int height = vFrame->height;
+
+    // 1️⃣ sws_scale에서 RGBA로 출력 (초기화 시 한 번만)
     if (swsCtx == NULL) {
-        static int sws_flags =  SWS_FAST_BILINEAR;
-        swsCtx = sws_getContext(pVCtx->width, pVCtx->height, pVCtx->pix_fmt, outputFrameSize.width, outputFrameSize.height, AV_PIX_FMT_RGB24, sws_flags, NULL, NULL, NULL);
-        av_image_alloc(dst_data, dst_linesize, pVCtx->width, pVCtx->height, AV_PIX_FMT_RGB24, 1);
+        static int sws_flags = SWS_FAST_BILINEAR;
+        swsCtx = sws_getContext(
+            pVCtx->width,
+            pVCtx->height,
+            pVCtx->pix_fmt,
+            outputFrameSize.width,
+            outputFrameSize.height,
+            AV_PIX_FMT_RGBA, // ✅ RGB24 -> RGBA로 바로 변환
+            sws_flags,
+            NULL, NULL, NULL
+        );
+
+        av_image_alloc(dst_data, dst_linesize,
+                       pVCtx->width,
+                       pVCtx->height,
+                       AV_PIX_FMT_RGBA, 1); // RGBA
     }
-    sws_scale(swsCtx, (uint8_t const * const *)vFrame->data, vFrame->linesize, 0, pVCtx->height, dst_data, dst_linesize);
-    
-    if (_delegate) {
-       UIImage *image = [self convertToUIImageFromYUV:dst_data linesize:dst_linesize[0] width:vFrame->width height:vFrame->height];
-       dispatch_sync(dispatch_get_main_queue(), ^{
-           if (image!= nil && (image.CGImage != nil || image.CIImage != nil)) {
-               //[self->_delegate receivedDecodedImage:[UIImage imageWithData:UIImagePNGRepresentation(image)]]; // png형식으로 압축 후 전달하기 때문에 row memory, high cpu
-               //[self->_delegate receivedDecodedImage:image]; // 압축 없이 원본을 전달하기 때문에 row cpu, high memory
-               [self->_delegate receivedDecodedImage:[UIImage imageWithData:UIImageJPEGRepresentation(image, 0.5)]];
-           } else {
-               [self->_delegate receivedDecodedImage:nil];
-           }
-       });
-   }
+
+    // 2️⃣ YUV -> RGBA 변환
+    sws_scale(swsCtx,
+              (uint8_t const * const *)vFrame->data,
+              vFrame->linesize,
+              0,
+              height,
+              dst_data,
+              dst_linesize);
+
+    // 3️⃣ CIImage 생성 (NSData 없이 바로 CIImage로)
+    CVPixelBufferRef pxBuffer = NULL;
+    CVPixelBufferCreateWithBytes(kCFAllocatorDefault,
+                                 width,
+                                 height,
+                                 kCVPixelFormatType_32BGRA,
+                                 dst_data[0],
+                                 dst_linesize[0],
+                                 NULL,
+                                 NULL,
+                                 NULL,
+                                 &pxBuffer);
+
+    CIImage *ciImage = [CIImage imageWithCVPixelBuffer:pxBuffer];
+    CVPixelBufferRelease(pxBuffer);
+
+    // 4️⃣ 밝기/대비 필터 적용
+    if (!_ciColorFilter) {
+        _ciColorFilter = [CIFilter filterWithName:@"CIColorControls"];
+    }
+    [_ciColorFilter setValue:ciImage forKey:kCIInputImageKey];
+    [_ciColorFilter setValue:@(self->currentContrast) forKey:kCIInputContrastKey];
+    [_ciColorFilter setValue:@(self->currentBrightness) forKey:kCIInputBrightnessKey];
+    CIImage *outputImage = _ciColorFilter.outputImage;
+
+    if (!_ciContext) {
+        _ciContext = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
+    }
+
+    // 5️⃣ delegate에 CIImage 직접 전달 (NSImage 생성 없이 GPU에서 렌더링)
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self->_delegate receivedDecodedCIImage:outputImage context:self->_ciContext size:CGSizeMake(width, height)];
+    });
 }
 
 - (void) drawAudio {
@@ -514,40 +557,6 @@ static void ffmpeg_log_callback(void* ptr, int level, const char* fmt, va_list v
     [data getBytes:*pcmBuffer.floatChannelData length:data.length];
 
     [self.player scheduleBuffer:pcmBuffer completionHandler:nil];
-}
-
-- (UIImage *) convertToUIImageFromYUV:(uint8_t **)dstData linesize:(int)linesize width:(int)width height:(int)height{
-    
-    CGBitmapInfo bitmapInfo = kCGBitmapByteOrderDefault;
-    CFDataRef data = CFDataCreateWithBytesNoCopy(kCFAllocatorDefault, dstData[0], linesize * height, kCFAllocatorNull);
-    
-    CGDataProviderRef provider = CGDataProviderCreateWithCFData(data);
-    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
-    
-    CGImageRef cgImage = CGImageCreate((unsigned long)width,
-                                       (unsigned long)height,
-                                       8,
-                                       24,
-                                       (size_t)linesize,
-                                       colorSpace,
-                                       bitmapInfo,
-                                       provider,
-                                       NULL,
-                                       NO,
-                                       kCGRenderingIntentDefault);
-    
-    CGColorSpaceRelease(colorSpace);
-    CIImage *ciImage = [CIImage imageWithCGImage:cgImage];
-    CIImage *grayscaleCIImage = [self grayscaleFilter:ciImage];
-    if (!grayscaleCIImage) {
-        grayscaleCIImage = ciImage;
-    }
-    UIImage *image = [UIImage imageWithCIImage:grayscaleCIImage];
-    CGImageRelease(cgImage);
-    CGDataProviderRelease(provider);
-    CFRelease(data);
-    
-    return image;
 }
 
 - (NSData *)playAudioFrame:(AVFrame *)audioFrame {
